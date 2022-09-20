@@ -1,0 +1,367 @@
+---
+title: "Modeling of B-cell subset cluster frequencies w/ 6-month antibody endpoint"
+output: 
+  html_document:
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+Plots for Fig 5. in Kardava et al., PNAS 2022
+
+Toggle between freq.type = "antigen-nonspecific" or "spike-specific" to run models using cluster size (relative to the number of CD19+ cells; Fig. S5A) 
+or RBD+S1+ cell frequency (relative to number of cells in clusters; Fig. S5B and S5C), respectively
+
+Note: To generate the markdown report, please change the knit directory to the project directory
+```{r model.option}
+freq.type = "spike-specific"
+cat("Cell frequency type:",freq.type,"\n")
+
+stopifnot(freq.type %in% c("antigen-nonspecific","spike-specific"))
+if (freq.type == "antigen-nonspecific") {
+  variable.of.interest <- "n_cells_in_cluster"
+  norm.factor <- "pct_of_cd19_total"
+} else if (freq.type == "spike-specific") {
+  variable.of.interest <- "double_count"
+  norm.factor <- "pct_of_cluster_total"
+} 
+```
+
+```{r setup, include=FALSE}
+data.folder <- "Data"
+output.folder <- paste0("final_output.6m.endpoint.",norm.factor,".",gsub("_",".",variable.of.interest,fixed = T))
+dir.create(output.folder)
+library(knitr)
+library(ggplot2)
+library(ggsci)
+library(ggpubr)
+library(gridExtra)
+library(lme4)
+library(lmerTest)
+library(dplyr)
+library(readxl)
+library(reshape2)
+library(zoo)
+knitr::opts_chunk$set(echo = TRUE)
+options(stringsAsFactors = FALSE)
+opts_knit$set(echo = TRUE, message = FALSE, warning = FALSE, cache.lazy = FALSE)
+opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache.lazy = FALSE)
+```
+
+### Data Import
+Import demographics and frequency data for each participant
+```{r import}
+# participant metadata
+metadata <- readRDS(file.path(data.folder,"pnas.participant.metadata.rds"))
+
+# month 6 antibody data
+ab.4plex <- readRDS(file.path(data.folder,"pnas.4plex.results.6m.endpoint.rds"))
+
+# flow cytometry cell cluster data
+cluster.data <- readRDS(file.path(data.folder,"pnas.cluster.data.rds"))
+cluster.groups <- readRDS(file.path(data.folder,"pnas.cluster.labels.rds"))
+
+count.data <- as.data.frame(cluster.data[,c("Code ID","fs_meta_cluster","dose.day",variable.of.interest,"n_cd19_total","n_cells_in_cluster")])
+colnames(count.data) <- c("subject_id","population","variable","value","cd19_count","pop_size")
+cluster.data$pct_of_cd19_total <- cluster.data[,variable.of.interest]/cluster.data$n_cd19_total
+cluster.data$pct_of_cluster_total <- cluster.data[,variable.of.interest]/cluster.data$n_cells_in_cluster
+freq.data <- as.data.frame(cluster.data[,c("Code ID","fs_meta_cluster","dose.day",norm.factor)])
+colnames(freq.data)[1:4] <- c("subject_id","population","variable","value")[1:4]
+
+count.data[,c("Dose","Day")] <- apply(do.call("rbind",sapply(trimws(as.character(count.data$variable)),strsplit,split="D"))[,2:3],2,as.numeric) 
+freq.data[,c("Dose","Day")] <- apply(do.call("rbind",sapply(trimws(as.character(freq.data$variable)),strsplit,split="D"))[,2:3],2,as.numeric) 
+
+# calculate true days from Dose 1 baseline
+freq.data$Day.with.offset <- metadata[freq.data$subject_id,"Days.between.dose"] + freq.data$Day
+freq.data[freq.data$Dose == 1,"Day.with.offset"] <- freq.data[freq.data$Dose == 1,"Day"]
+count.data$Day.with.offset <- metadata[count.data$subject_id,"Days.between.dose"] + count.data$Day
+count.data[count.data$Dose == 1,"Day.with.offset"] <- count.data[count.data$Dose == 1,"Day"]
+
+```
+
+#### Cluster Selection
+Select clusters for further consideration
+```{r cluster.selection}
+pop.of.interest <- unique(freq.data$population)
+freq.data$timepoint <- NA
+freq.data[freq.data$Day %in% metadata$Day.of.baseline,"timepoint"] <- "D00"
+freq.data[freq.data$Day %in% metadata$Visit.day.post.dose.1,"timepoint"] <- "D07"
+freq.data[freq.data$Day %in% metadata$Visit.day.post.dose.1.1,"timepoint"] <- "D10"
+freq.data[freq.data$Day %in% metadata$Visit.day.post.dose.1.2,"timepoint"] <- "D14"
+freq.data[freq.data$Day %in% metadata$Day.baseline.post.dose.2,"timepoint"] <- "D00"
+freq.data[freq.data$Day %in% metadata$Visit.day.post.dose.2 & freq.data$Dose == 2,"timepoint"] <- "D05" # only 3
+freq.data[freq.data$Day %in% metadata$Visit.day.post.dose.2.1 & freq.data$Dose == 2,"timepoint"] <- "D07"
+freq.data[freq.data$Day %in% metadata$Visit.day.post.dose.2.2 & freq.data$Dose == 2,"timepoint"] <- "D10"
+freq.data[freq.data$Day %in% metadata$Visit.day.post.dose.2.3 & freq.data$Dose == 2,"timepoint"] <- "D14"
+freq.data[freq.data$Day %in% metadata$Visit.day.post.dose.2.4 & freq.data$Dose == 2,"timepoint"] <- "D14" # only 2
+freq.data[freq.data$Day %in% metadata$Visit.day.post.dose.2.5 & freq.data$Dose == 2,"timepoint"] <- "D28"
+freq.data[is.na(freq.data$Day),"timepoint"] <- "AUC"
+table(freq.data[,c("Dose","timepoint")])
+freq.data$dose.timepoint <- interaction(freq.data$Dose,freq.data$timepoint)
+freq.data <- subset(freq.data,!is.na(value))
+
+# population with large enough counts
+freq.data.mean.variance <- aggregate(freq.data$value,list(freq.data$population),function(x){c(mean(x),var(x))})
+count.data.mean.variance <- aggregate(count.data$value,list(count.data$population),function(x){c(mean(x),max(x))})
+pop.of.interest <- intersect(pop.of.interest,count.data.mean.variance[count.data.mean.variance$x[,2] > 3,"Group.1"])
+
+# populations with sig. difference with pre-vaccine baseline
+model.res <- data.frame()
+trend.plots <- list()
+pair.contrast <- data.frame()
+freq.data$dose.timepoint <- relevel(freq.data$dose.timepoint,ref = "1.D00")
+for (pop in pop.of.interest) {
+  #cat(pop,"\n")
+  pop.data <- subset(freq.data,population == pop)
+  pop.data <- cbind(pop.data,metadata[pop.data$subject_id,c("Age.at.day.of.vaccine","Gender.at.Birth")])
+  offset <- subset(freq.data.mean.variance,Group.1 == pop)[,2][2]/2 # use variance as offset
+  
+  # discrete
+  lm.res <- lmer(log(value+offset) ~ dose.timepoint + Age.at.day.of.vaccine + Gender.at.Birth + (1|subject_id),pop.data)
+  lm.summary <- summary(lm.res)
+
+  model.res <- rbind(model.res,cbind(population=pop,term=rownames(lm.summary$coefficients),
+                                     lm.summary$coefficients))
+}
+model.res.filtered <- model.res[grep("dose.timepoint",model.res$term),]
+model.res.filtered$p.val <- as.numeric(model.res.filtered$`Pr(>|t|)`)
+model.res.filtered <- model.res.filtered %>% group_by(term) %>% mutate(baseline.adj.p = p.adjust(p.val,method = "BH"))
+pop.of.interest <- names(table(subset(model.res.filtered,baseline.adj.p < 0.05)$population))
+```
+
+#### Normalization
+Normalize by dose 1 or dose 2 baseline either by taking the difference
+```{r normalize}
+freq.data.1.D00 <- subset(freq.data,dose.timepoint == "1.D00")
+freq.data.2.D00 <- subset(freq.data,dose.timepoint == "2.D00")
+freq.data.normalized <- merge(freq.data,freq.data.1.D00[,1:4],all.x=T,by=colnames(freq.data)[1:2],suffixes = c("",".baseline"))
+freq.data.normalized <- merge(freq.data.normalized,freq.data.2.D00[,1:4],all.x=T,by=colnames(freq.data)[1:2],suffixes = c("",".dose2.baseline"))
+
+# assume baseline to be 0 for missing ones if most of the other are also 0
+if (quantile(freq.data.normalized$value.baseline,0.95,na.rm = T) == 0) {
+  freq.data.normalized[is.na(freq.data.normalized$value.baseline),"value.baseline"] <- 0
+}
+# subtract from baseline
+freq.data.normalized$d1.norm.freq <- freq.data.normalized$value - freq.data.normalized$value.baseline
+freq.data.normalized$d2.norm.freq <- freq.data.normalized$value - freq.data.normalized$value.dose2.baseline
+```
+
+#### Antibody Endpoints
+Calculate association between antibody levels at target endpoint and cluster frequencies at different timepoints 
+```{r antibody}
+# determine whether dose response relative to dose baseline are associated with antibody level at 6 months
+day.order <- c("1.D00","1.D07","1.D10","1.D14","2.D00","2.D07","2.D10","2.D14","2.D28")
+days <- list(value=day.order,
+             d1=c("1.D07","1.D10","1.D14","2.D00"),#,"2.D07","2.D10","2.D14","2.D28"),
+             d2=c("2.D07","2.D10","2.D14","2.D28"))
+pop.ab.lm.res <- data.frame()
+pop.ab.scatter.plots <- list()
+for (term in c("d1.norm.freq","d2.norm.freq")) {
+  cat(term,"-\n")
+  dose <- unlist(strsplit(term,".",fixed = T))[1]
+  rel.freq.matrix <- reshape2::dcast(subset(freq.data.normalized,population %in% pop.of.interest),
+                                     subject_id ~ population + dose.timepoint,value.var = term,fun.aggregate = mean)
+  rownames(rel.freq.matrix) <- rel.freq.matrix$subject_id
+  rel.freq.matrix <- rel.freq.matrix[,-1]
+  for (day in days[[dose]]) {
+    dose.pop.freq <- rel.freq.matrix[,paste0(pop.of.interest,"_",day)]
+    
+    # for each isotype
+    for (ab in unique(subset(ab.4plex,!is.na(Readout_AU.mL))$Readout_AU.mL)) {
+      ab.single.6months <- subset(ab.4plex,Readout_AU.mL == ab)
+      ab.single.6months <- cbind(ab.single.6months,dose.pop.freq[ab.single.6months$subject_id,,drop=F])
+      ab.single.6months <- cbind(ab.single.6months,metadata[ab.single.6months$subject_id,c("Age.at.day.of.vaccine","Gender.at.Birth")])
+      for (i in c("S2P","RBD")) {
+        # convert endpoint values to numeric
+        ab.single.6months$endpoint <- ab.single.6months[,i]
+        ab.single.6months$endpoint[grep("less than",ab.single.6months$endpoint)]
+        ab.single.6months$endpoint[grep("less than",ab.single.6months$endpoint)] <- "0"
+        ab.single.6months$endpoint <- log2(as.numeric(ab.single.6months$endpoint)+1)
+        ab.single.6months$endpoint.rank <- rank(as.numeric(ab.single.6months$endpoint),na.last = "keep")/length(ab.single.6months$endpoint)
+        
+        # skip populations with small variance
+        pop.to.test <- names(which(apply(ab.single.6months[grep("^C",colnames(ab.single.6months))],2,function(x){length(unique(x[!is.na(x)]))}) >= 5))
+        for (pop in pop.to.test) {
+          # draw scatter plot
+          pop.ab.scatter.plots[[paste0(pop,"/",ab,"_",i)]] <- ggplot(ab.single.6months,aes_string(pop,"endpoint")) 
+          
+          #scale
+          model.string <- paste0("endpoint ~ scale(",pop,")  + Age.at.day.of.vaccine + Gender.at.Birth")
+          lm.res <- lm(as.formula(model.string),ab.single.6months)
+          lm.summary <- summary(lm.res)
+          pop.ab.lm.res <- rbind(pop.ab.lm.res,data.frame(type=term,timepoint=day,antibody=ab,protein=i,population=pop,
+                                                          term=rownames(lm.summary$coefficients),lm.summary$coefficients))
+          
+          #binary
+          ab.single.6months$binary <- ab.single.6months[pop] > 0
+          model.string <- paste0("endpoint ~ binary + Age.at.day.of.vaccine + Gender.at.Birth")
+          lm.res <- lm(as.formula(model.string),ab.single.6months)
+          lm.summary <- summary(lm.res)
+          
+          pop.ab.lm.res <- rbind(pop.ab.lm.res,data.frame(type=term,timepoint=day,antibody=ab,protein=i,population=pop,
+                                                          term=rownames(lm.summary$coefficients),lm.summary$coefficients))
+          
+          #rank
+          ab.single.6months$rank <- rank(ab.single.6months[pop],na.last = "keep")
+          model.string <- paste0("endpoint.rank ~ rank  + Age.at.day.of.vaccine + Gender.at.Birth")
+          lm.res <- lm(as.formula(model.string),ab.single.6months)
+          lm.summary <- summary(lm.res)
+          
+          pop.ab.lm.res <- rbind(pop.ab.lm.res,data.frame(type=term,timepoint=day,antibody=ab,protein=i,population=pop,
+                                                          term=rownames(lm.summary$coefficients),lm.summary$coefficients))
+        }
+      }
+    }
+  }
+}
+
+# save results
+var.types <- "scale"
+sig.ab.pops <- list()
+for (vt in var.types) {
+  pop.ab.lm.res.filtered <- pop.ab.lm.res[grep(paste0("^",vt),pop.ab.lm.res$term),]
+  pop.ab.lm.res.filtered$term <- sapply(pop.ab.lm.res.filtered$population,function(x){unlist(strsplit(x,"_"))[1]})
+  pop.ab.lm.res.filtered <- pop.ab.lm.res.filtered %>% group_by(timepoint,protein,antibody) %>% mutate(p.adj = p.adjust(Pr...t..,method = "BH"))
+  write.csv(pop.ab.lm.res.filtered,file.path(output.folder,paste0("flex4.asso.w.dose.response.model.res.",variable.of.interest,".",vt,".csv")))
+  pop.ab.lm.res.filtered <- pop.ab.lm.res.filtered[grep("AUC",pop.ab.lm.res.filtered$timepoint,invert = T),]
+  pop.ab.lm.res.filtered <- pop.ab.lm.res.filtered[grep("log2.FC",pop.ab.lm.res.filtered$type,invert = T),]
+  sig.ab.pops[[vt]] <- subset(pop.ab.lm.res.filtered,Pr...t.. <= 0.05 & antibody != "IgM")
+  show.pop <- setdiff(unique(sig.ab.pops[[vt]]$term),c("C1")) # skip C1 from plot
+  
+  pop.ab.lm.res.filtered <- pop.ab.lm.res.filtered[order(pop.ab.lm.res.filtered$timepoint),]
+  pop.ab.lm.res.filtered$timepoint <- paste0("v",gsub("D0","D",gsub(".","",pop.ab.lm.res.filtered$timepoint,fixed = T)))
+  pop.ab.lm.res.filtered$timepoint <- factor(pop.ab.lm.res.filtered$timepoint,levels = unique(pop.ab.lm.res.filtered$timepoint))
+  pop.ab.lm.res.filtered$term.label <-  cluster.groups[match(pop.ab.lm.res.filtered$term,cluster.groups$Cluster),"Cluster.label"]
+  pdf(file.path(output.folder,paste0("flex4.asso.w.dose.response.",variable.of.interest,".",vt,".pdf")),width=4.5,height=4.5)
+  for (denorm in unique(pop.ab.lm.res.filtered$type)) {
+    tmp <- subset(pop.ab.lm.res.filtered,antibody != "IgM" & term %in% show.pop & type == denorm)
+    print(ggplot(tmp,aes(timepoint,term.label)) + 
+            #geom_point(aes(fill=Estimate,alpha=Pr...t..<0.05,size=protein),pch=22) +
+            geom_point(data=subset(tmp,protein == "RBD"),aes(fill=Estimate,alpha=Pr...t..<0.05),position = position_nudge(x=0.1),pch=22,size=4) +
+            geom_point(data=subset(tmp,protein == "S2P"),aes(fill=Estimate,alpha=Pr...t..<0.05),position = position_nudge(x=-0.1),pch=22,size=4) +
+            scale_fill_gradient2(low=scales::muted("blue"),high="#DC0000B2",limit=c(min(pop.ab.lm.res.filtered$Estimate),max(pop.ab.lm.res.filtered$Estimate))) +
+            scale_alpha_manual(name="p < 0.05",values=c(0.3,0.95)) +
+            scale_color_manual(values=c("gray60","black")) + theme(text=element_text(size=8)) +
+            facet_grid(antibody~.,scales = "free",space = "free") + theme_bw() + ylab("cluster") +
+            ggtitle(paste0("Relative to ",gsub(".norm.freq"," baseline",denorm)),vt) + xlab("Time Point") + ylab("Cluster"))
+  }
+  dev.off()
+}
+```
+
+#### PC1 of all titer responses
+Use PC1 of different titer endpoints to summarize association with frequencies
+```{r PCA}
+pop.ab.target <- reshape2::melt(ab.4plex,measure.vars = c("S2P","Nprotein","RBD"))
+pop.ab.target$value <- as.numeric(pop.ab.target$value)
+pop.ab.target <- reshape2::dcast(pop.ab.target,subject_id ~ Readout_AU.mL + variable,fun.aggregate = mean,value.var = "value")
+rownames(pop.ab.target) <- pop.ab.target[,1]
+pop.ab.target <- pop.ab.target[,-1]
+
+tmp <- log2(pop.ab.target[,grep("Ig(G|A)_(RBD|S2P)",colnames(pop.ab.target))])
+pca <- prcomp(tmp,center = T,scale. = T)
+ab.pc1 <- pca$x[,"PC1"]
+direction <- cor(rowMeans(tmp),ab.pc1)
+if (direction < 0) {
+  cat("Flip PC1 direction to align with mean titer levels.\n")
+  ab.pc1 <- -ab.pc1
+}
+
+# include v1D0 baseline in the test
+pc1.lm.res <- data.frame()
+for (term in c("d1.norm.freq","d2.norm.freq")) {
+  cat(term,"-\n")
+  dose <- unlist(strsplit(term,".",fixed = T))[1]
+  rel.freq.matrix <- reshape2::dcast(freq.data.normalized,
+                                     subject_id ~ population + dose.timepoint,value.var = term,fun.aggregate = mean)
+  rownames(rel.freq.matrix) <- rel.freq.matrix$subject_id
+  rel.freq.matrix <- rel.freq.matrix[,-1]
+  
+  # only clusters with more than 3 double+ counts in any samples
+  freq.matrix <- rel.freq.matrix[,grep(paste0(paste0(count.data.mean.variance[count.data.mean.variance$x[,2] > 3,"Group.1"],
+                                                   collapse = "_|"),"_"),colnames(rel.freq.matrix))]
+  freq.matrix <- freq.matrix[,apply(freq.matrix,2,var,na.rm=T) > 0 & apply(freq.matrix,2,function(x){length(unique(x[!is.na(x)]))}) > 5]
+  
+  for (day in days[[dose]]) {
+    dose.pop.freq <- freq.matrix[,grep(paste0("_",day),colnames(freq.matrix))]
+  
+    if (ncol(dose.pop.freq) > 0) {
+      for (i in 1:ncol(dose.pop.freq)) {
+        ab.single.6months <- cbind(dose.pop.freq[,i,drop=F],metadata[rownames(dose.pop.freq),c("Age.at.day.of.vaccine","Gender.at.Birth")])
+        ab.single.6months$PC1 <- ab.pc1[rownames(ab.single.6months)]
+        #ab.single.6months <- merge(ab.single.6months,a,by="row.names")
+        model.string <- paste0("PC1 ~ scale(",colnames(ab.single.6months)[1],")  + Age.at.day.of.vaccine + Gender.at.Birth")
+        lm.res <- lm(as.formula(model.string),ab.single.6months)
+        lm.summary <- summary(lm.res)
+        
+        pc1.lm.res <- rbind(pc1.lm.res,data.frame(type="cluster size",population=colnames(dose.pop.freq)[i],
+                                                  term=rownames(lm.summary$coefficients),lm.summary$coefficients))
+      }
+    }
+  }
+}
+
+# save results
+# sig. pop in linear model
+pc1.lm.res[,c("cluster","dose","day")] <- do.call("rbind",sapply(trimws(as.character(pc1.lm.res$population)),strsplit,split="(_|\\.D)"))[,1:3] 
+# c8 is not B cells
+#pc1.lm.res <- subset(pc1.lm.res,cluster != "C8")
+pc1.lm.res <- pc1.lm.res[grep("^scale",pc1.lm.res$term),]
+pc1.lm.res$cluster.label <-  factor(cluster.groups[match(pc1.lm.res$cluster,cluster.groups$Cluster),"Cluster.label"],
+                                    levels = cluster.groups$Cluster.label)
+pc1.lm.res <- pc1.lm.res %>% group_by(type,dose,day) %>% mutate(p.adj = p.adjust(Pr...t..,method="BH"))
+write.csv(pc1.lm.res,file=file.path(output.folder,"pc1.lm.res.csv"),row.names = F)
+
+pc1.lm.res$normalization <- "relative to v1 baseline"
+pc1.lm.res[grep("1.D00",pc1.lm.res$population),]$normalization <- " v1 baseline"
+pc1.lm.res[grep("2.D",pc1.lm.res$population),]$normalization <- "relative to v2 baseline"
+pc1.lm.res[grep("2.D00",pc1.lm.res$population),]$normalization <- "relative to v1 baseline"
+pdf(file.path(output.folder,paste0("log2.ab.titer.pc1.pop.cluster.size.effect.",variable.of.interest,".pdf")),width=8,height=3)
+sig.pop <- setdiff(subset(pc1.lm.res,Pr...t.. <= 0.05 & type == "cluster size")$cluster,"C30") # skip C30 from plot
+ggplot(subset(pc1.lm.res,type == "cluster size" & cluster %in% sig.pop),aes(cluster.label,paste0("v",dose,"D",day))) + 
+  geom_point(aes(fill=Estimate,alpha=Pr...t..<0.05,size=-log10(Pr...t..)),pch=21) +
+   scale_fill_viridis_c() +
+            scale_alpha_manual(name="p < 0.05",values=c(0.3,0.95)) +
+  scale_size_continuous(name="-log10(p)") +
+  coord_flip() + theme_light() + ylab("Timepoint") + xlab("Cluster") + facet_grid(~normalization,scales = "free",space = "free") + 
+  theme(text=element_text(size=10),legend.direction = "horizontal",
+        strip.background = element_rect(fill="white"),strip.text = element_text(color="black",size=10)) + ggtitle("Association with Titer PC1")
+dev.off()
+
+```
+
+#### Correlation plots
+Plot correlations with selected clusters
+```{r correlation}
+sig.pops.to.plot <- as.data.frame(sig.ab.pops$scale)#subset(as.data.frame(sig.ab.pops$scale),term == "C6")
+sig.pops.to.plot$cluster.label <-  cluster.groups[match(sig.pops.to.plot$term,cluster.groups$Cluster),"Cluster.label"]
+sig.pops.to.plot$timepoint <- gsub("D0","D",gsub(".","",sig.pops.to.plot$timepoint,fixed = T))
+pdf(file.path(output.folder,paste0("scatter.plot.sig.ab.pop.correlation.",variable.of.interest,".pdf")),width=2.5,height=3)
+for (i in 1:nrow(sig.pops.to.plot)) {
+  if (norm.factor == "pct_of_cluster_total") {
+    g2 <- pop.ab.scatter.plots[[paste0(sig.pops.to.plot[i,"population"],"/",sig.pops.to.plot[i,"antibody"],"_",sig.pops.to.plot[i,"protein"])]] +
+      geom_point(size=2,alpha=0.75,fill="lightblue",pch=21) + stat_cor(method="spearman",cor.coef.name = "rho",label.x.npc = 0.1,label.y.npc = "bottom") +
+      ggtitle(paste0("Effect size: ",sprintf("%.3f",sig.pops.to.plot[i,"Estimate"]),
+                     ", p = ",sprintf("%.3f",sig.pops.to.plot[i,"Pr...t.."]))) +  
+      theme_bw() + theme(plot.title =element_text(size=10,hjust=.5),text=element_text(size=10),aspect.ratio = 1) +
+      ylab(paste0("log2 ",sig.pops.to.plot[i,"protein"]," ",sig.pops.to.plot[i,"antibody"]," at month 6")) + 
+      xlab(paste0(sig.pops.to.plot[i,"cluster.label"]," RBD+S1+\nfreq. at v",sig.pops.to.plot[i,"timepoint"]))
+  } else {
+    g2 <- pop.ab.scatter.plots[[paste0(sig.pops.to.plot[i,"population"],"/",sig.pops.to.plot[i,"antibody"],"_",sig.pops.to.plot[i,"protein"])]] + 
+      geom_point(size=2,alpha=0.75,fill="orange",pch=21) + stat_cor(method="spearman",cor.coef.name = "rho",label.x.npc = 0.1,label.y.npc = "bottom") +
+      ggtitle(paste0("Effect size: ",sprintf("%.3f",sig.pops.to.plot[i,"Estimate"]),
+                     ", p = ",sprintf("%.3f",sig.pops.to.plot[i,"Pr...t.."]))) + 
+      theme_bw() + theme(plot.title =element_text(size=10,hjust=.5),text=element_text(size=10),aspect.ratio = 1) +
+      ylab(paste0("log2 ",sig.pops.to.plot[i,"protein"]," ",sig.pops.to.plot[i,"antibody"],"")) +
+      xlab(paste0(sig.pops.to.plot[i,"cluster.label"]," cluster size\nat v",sig.pops.to.plot[i,"timepoint"]))
+  }
+
+  print(g2)
+}
+dev.off()
+```
+
+#### Session Info
+```{r session}
+sessionInfo()
+```
